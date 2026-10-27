@@ -1,10 +1,13 @@
+
 name: Build APK from uploaded zip
 
-# Upload ONE .zip (the CSharpStudio project) to the repository root.
-# This workflow unpacks it, builds the app and publishes app-debug.apk under Releases.
+# Upload exactly one CSharpStudio project ZIP to the repository root.
+# Builds the Android APK and uploads it as a workflow artifact.
+
 on:
   push:
-    paths: ['*.zip']
+    paths:
+      - '*.zip'
   workflow_dispatch:
 
 permissions:
@@ -13,50 +16,110 @@ permissions:
 jobs:
   apk:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Unpack the uploaded zip
+        shell: bash
         run: |
-          N=$(ls *.zip 2>/dev/null | wc -l)
-          if [ "$N" != "1" ]; then echo "::error::Keep exactly one .zip in the repository root (found $N)."; exit 1; fi
-          mkdir /tmp/src
-          unzip -q *.zip -d /tmp/src
-          CFG=$(find /tmp/src -name capacitor.config.json -not -path '*/node_modules/*' | head -1)
-          if [ -z "$CFG" ]; then echo "::error::capacitor.config.json not found inside the zip."; exit 1; fi
+          set -euo pipefail
+
+          N=$(find . -maxdepth 1 -type f -name '*.zip' | wc -l)
+
+          if [ "$N" != "1" ]; then
+            echo "::error::Keep exactly one ZIP in the repository root. Found $N."
+            exit 1
+          fi
+
+          mkdir -p /tmp/src
+          ZIP=$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)
+          unzip -q "$ZIP" -d /tmp/src
+
+          CFG=$(find /tmp/src -type f \
+            -name capacitor.config.json \
+            -not -path '*/node_modules/*' \
+            -print -quit)
+
+          if [ -z "$CFG" ]; then
+            echo "::error::capacitor.config.json was not found inside the ZIP."
+            exit 1
+          fi
+
           echo "PROJ=$(dirname "$CFG")" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-dotnet@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
 
       - name: Publish compiler (Blazor WASM + Roslyn)
         working-directory: ${{ env.PROJ }}
-        run: dotnet publish Compiler/CSharpStudio.csproj -c Release -o publish
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dotnet publish Compiler/CSharpStudio.csproj \
+            -c Release \
+            -o publish
 
       - name: Verify output has what the app needs
         working-directory: ${{ env.PROJ }}
+        shell: bash
         run: |
-          F=publish/wwwroot/_framework
-          ls $F | head -80
-          test -f $F/blazor.boot.json
-          test -f $F/System.Private.CoreLib.dll
-          test -f $F/System.Console.dll
-          test -f $F/Microsoft.CodeAnalysis.CSharp.dll
-          test -f $F/Microsoft.CSharp.dll
-          test -f publish/wwwroot/index.html
-          # Capacitor's Android asset merger treats precompressed Blazor files
-          # (.gz/.br) as duplicate assets beside the original files. A WebView
-          # can load the uncompressed files directly, so remove sidecar copies.
-          find publish/wwwroot -type f \( -name '*.gz' -o -name '*.br' \) -delete
-          if find publish/wwwroot -type f \( -name '*.gz' -o -name '*.br' \) | grep -q .; then
-            echo "::error::Compressed sidecar files remain in publish/wwwroot."
+          set -euo pipefail
+
+          F="publish/wwwroot/_framework"
+
+          echo "Checking published framework files..."
+
+          if [ ! -d "$F" ]; then
+            echo "::error::Framework directory is missing: $F"
             exit 1
           fi
+
+          ls "$F" | head -80
+
+          require_file() {
+            local pattern="$1"
+
+            if ! compgen -G "$F/$pattern" > /dev/null; then
+              echo "::error::Missing required framework file matching: $pattern"
+              exit 1
+            fi
+
+            echo "Found: $pattern"
+          }
+
+          require_file 'blazor.boot.json'
+          require_file 'System.Private.CoreLib*.dll'
+          require_file 'System.Console*.dll'
+          require_file 'Microsoft.CodeAnalysis.CSharp*.dll'
+          require_file 'Microsoft.CSharp*.dll'
+
+          if [ ! -f publish/wwwroot/index.html ]; then
+            echo "::error::Published index.html is missing."
+            exit 1
+          fi
+
+          echo "All required output files were found."
+
+          # Remove compressed sidecar files to avoid duplicate Android assets.
+          find publish/wwwroot -type f \
+            \( -name '*.gz' -o -name '*.br' \) -delete
+
+          if find publish/wwwroot -type f \
+            \( -name '*.gz' -o -name '*.br' \) | grep -q .; then
+            echo "::error::Compressed sidecar files remain."
+            exit 1
+          fi
+
           rm -rf www
           cp -r publish/wwwroot www
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
 
@@ -64,34 +127,81 @@ jobs:
         working-directory: ${{ env.PROJ }}
         run: npm install
 
-      - uses: actions/setup-java@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
 
       - name: Create Android project
         working-directory: ${{ env.PROJ }}
+        shell: bash
         run: |
+          set -euo pipefail
+
           npx cap add android
-          M=android/app/src/main/AndroidManifest.xml
-          sed -i 's/<application/<application android:largeHeap="true"/' $M
-          grep -q largeHeap $M
-          if ! grep -q windowSoftInputMode $M; then sed -i 's/<activity/<activity android:windowSoftInputMode="adjustResize"/' $M; fi
+
+          M="android/app/src/main/AndroidManifest.xml"
+
+          sed -i 's/<application/<application android:largeHeap="true"/' "$M"
+
+          if ! grep -q 'largeHeap' "$M"; then
+            echo "::error::Failed to enable largeHeap."
+            exit 1
+          fi
+
+          if ! grep -q 'windowSoftInputMode' "$M"; then
+            sed -i \
+              's/<activity/<activity android:windowSoftInputMode="adjustResize"/' \
+              "$M"
+          fi
+
           npx cap sync android
 
       - name: Build debug APK
         working-directory: ${{ env.PROJ }}
-        run: cd android && chmod +x gradlew && ./gradlew assembleDebug
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
 
-      - uses: actions/upload-artifact@v4
+      - name: Verify APK exists
+        working-directory: ${{ env.PROJ }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="android/app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "::error::APK was not generated or is empty."
+            exit 1
+          fi
+
+          ls -lh "$APK"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
         with:
           name: csharp-studio-apk
           path: ${{ env.PROJ }}/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Publish APK under Releases
         working-directory: ${{ env.PROJ }}
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          gh release create "apk-${{ github.run_number }}" android/app/build/outputs/apk/debug/app-debug.apk \
-            --repo "$GITHUB_REPOSITORY" --title "C# Studio APK #${{ github.run_number }}" --notes "Debug build from the uploaded zip."
+          set -euo pipefail
+
+          TAG="apk-${{ github.run_number }}"
+          APK="android/app/build/outputs/apk/debug/app-debug.apk"
+
+          gh release create "$TAG" "$APK" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "C# Studio APK #${{ github.run_number }}" \
+            --notes "Debug APK built from the uploaded ZIP."
