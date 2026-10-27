@@ -1,0 +1,96 @@
+name: Build APK from uploaded zip
+
+# Upload ONE .zip (the CSharpStudio project) to the repository root.
+# This workflow unpacks it, builds the app and publishes app-debug.apk under Releases.
+on:
+  push:
+    paths: ['*.zip']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack the uploaded zip
+        run: |
+          N=$(ls *.zip 2>/dev/null | wc -l)
+          if [ "$N" != "1" ]; then echo "::error::Keep exactly one .zip in the repository root (found $N)."; exit 1; fi
+          mkdir /tmp/src
+          unzip -q *.zip -d /tmp/src
+          CFG=$(find /tmp/src -name capacitor.config.json -not -path '*/node_modules/*' | head -1)
+          if [ -z "$CFG" ]; then echo "::error::capacitor.config.json not found inside the zip."; exit 1; fi
+          echo "PROJ=$(dirname "$CFG")" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Publish compiler (Blazor WASM + Roslyn)
+        working-directory: ${{ env.PROJ }}
+        run: dotnet publish Compiler/CSharpStudio.csproj -c Release -o publish
+
+      - name: Verify output has what the app needs
+        working-directory: ${{ env.PROJ }}
+        run: |
+          F=publish/wwwroot/_framework
+          ls $F | head -80
+          test -f $F/blazor.boot.json
+          test -f $F/System.Private.CoreLib.dll
+          test -f $F/System.Console.dll
+          test -f $F/Microsoft.CodeAnalysis.CSharp.dll
+          test -f publish/wwwroot/index.html
+          # Capacitor's Android asset merger treats precompressed Blazor files
+          # (.gz/.br) as duplicate assets beside the original files. A WebView
+          # can load the uncompressed files directly, so remove sidecar copies.
+          find publish/wwwroot -type f \( -name '*.gz' -o -name '*.br' \) -delete
+          if find publish/wwwroot -type f \( -name '*.gz' -o -name '*.br' \) | grep -q .; then
+            echo "::error::Compressed sidecar files remain in publish/wwwroot."
+            exit 1
+          fi
+          rm -rf www
+          cp -r publish/wwwroot www
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Capacitor
+        working-directory: ${{ env.PROJ }}
+        run: npm install
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Create Android project
+        working-directory: ${{ env.PROJ }}
+        run: |
+          npx cap add android
+          M=android/app/src/main/AndroidManifest.xml
+          sed -i 's/<application/<application android:largeHeap="true"/' $M
+          grep -q largeHeap $M
+          if ! grep -q windowSoftInputMode $M; then sed -i 's/<activity/<activity android:windowSoftInputMode="adjustResize"/' $M; fi
+          npx cap sync android
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJ }}
+        run: cd android && chmod +x gradlew && ./gradlew assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: csharp-studio-apk
+          path: ${{ env.PROJ }}/android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish APK under Releases
+        working-directory: ${{ env.PROJ }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "apk-${{ github.run_number }}" android/app/build/outputs/apk/debug/app-debug.apk \
+            --repo "$GITHUB_REPOSITORY" --title "C# Studio APK #${{ github.run_number }}" --notes "Debug build from the uploaded zip."
