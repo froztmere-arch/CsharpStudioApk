@@ -28,7 +28,7 @@ jobs:
 
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 8.0.x
+          dotnet-version: 10.0.x
 
       - name: Publish compiler (Blazor WASM + Roslyn)
         working-directory: ${{ env.PROJ }}
@@ -43,6 +43,7 @@ jobs:
           test -f $F/System.Private.CoreLib.dll
           test -f $F/System.Console.dll
           test -f $F/Microsoft.CodeAnalysis.CSharp.dll
+          test -f $F/Microsoft.CSharp.dll
           test -f publish/wwwroot/index.html
           # Capacitor's Android asset merger treats precompressed Blazor files
           # (.gz/.br) as duplicate assets beside the original files. A WebView
