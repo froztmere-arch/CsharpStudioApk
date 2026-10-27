@@ -1,13 +1,11 @@
 
 name: Build APK from uploaded zip
 
-# Upload exactly one CSharpStudio project ZIP to the repository root.
-# Builds the Android APK and uploads it as a workflow artifact.
-
 on:
   push:
     paths:
       - '*.zip'
+      - '.github/workflows/build-apk.yml'
   workflow_dispatch:
 
 permissions:
@@ -26,16 +24,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          N=$(find . -maxdepth 1 -type f -name '*.zip' | wc -l)
+          mapfile -t ZIPS < <(find . -maxdepth 1 -type f -name '*.zip')
 
-          if [ "$N" != "1" ]; then
-            echo "::error::Keep exactly one ZIP in the repository root. Found $N."
+          if [ "${#ZIPS[@]}" -ne 1 ]; then
+            echo "::error::Keep exactly one project ZIP in the repository root."
             exit 1
           fi
 
           mkdir -p /tmp/src
-          ZIP=$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)
-          unzip -q "$ZIP" -d /tmp/src
+          unzip -q "${ZIPS[0]}" -d /tmp/src
 
           CFG=$(find /tmp/src -type f \
             -name capacitor.config.json \
@@ -43,7 +40,7 @@ jobs:
             -print -quit)
 
           if [ -z "$CFG" ]; then
-            echo "::error::capacitor.config.json was not found inside the ZIP."
+            echo "::error::capacitor.config.json not found inside ZIP."
             exit 1
           fi
 
@@ -60,6 +57,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [ ! -f Compiler/CSharpStudio.csproj ]; then
+            echo "::error::Compiler/CSharpStudio.csproj was not found."
+            exit 1
+          fi
+
           dotnet publish Compiler/CSharpStudio.csproj \
             -c Release \
             -o publish
@@ -72,24 +74,23 @@ jobs:
 
           F="publish/wwwroot/_framework"
 
-          echo "Checking published framework files..."
-
           if [ ! -d "$F" ]; then
-            echo "::error::Framework directory is missing: $F"
+            echo "::error::Framework directory not found: $F"
             exit 1
           fi
 
-          ls "$F" | head -80
+          echo "Published framework files:"
+          find "$F" -maxdepth 1 -type f -printf '%f\n' | sort
 
           require_file() {
             local pattern="$1"
 
             if ! compgen -G "$F/$pattern" > /dev/null; then
-              echo "::error::Missing required framework file matching: $pattern"
+              echo "::error::Required file missing: $pattern"
               exit 1
             fi
 
-            echo "Found: $pattern"
+            echo "OK: $pattern"
           }
 
           require_file 'blazor.boot.json'
@@ -103,29 +104,33 @@ jobs:
             exit 1
           fi
 
-          echo "All required output files were found."
-
-          # Remove compressed sidecar files to avoid duplicate Android assets.
+          # Remove compressed copies that may conflict with
+          # the original files in the Android asset merger.
           find publish/wwwroot -type f \
             \( -name '*.gz' -o -name '*.br' \) -delete
-
-          if find publish/wwwroot -type f \
-            \( -name '*.gz' -o -name '*.br' \) | grep -q .; then
-            echo "::error::Compressed sidecar files remain."
-            exit 1
-          fi
 
           rm -rf www
           cp -r publish/wwwroot www
 
+          echo "Web application output verified."
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
-      - name: Install Capacitor
+      - name: Install Capacitor dependencies
         working-directory: ${{ env.PROJ }}
-        run: npm install
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f package.json ]; then
+            echo "::error::package.json was not found."
+            exit 1
+          fi
+
+          npm install
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -139,15 +144,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          npx cap add android
+          if [ ! -d android ]; then
+            npx cap add android
+          fi
+
+          npx cap sync android
 
           M="android/app/src/main/AndroidManifest.xml"
 
-          sed -i 's/<application/<application android:largeHeap="true"/' "$M"
+          if [ ! -f "$M" ]; then
+            echo "::error::AndroidManifest.xml was not found."
+            exit 1
+          fi
 
           if ! grep -q 'largeHeap' "$M"; then
-            echo "::error::Failed to enable largeHeap."
-            exit 1
+            sed -i \
+              's/<application/<application android:largeHeap="true"/' \
+              "$M"
           fi
 
           if ! grep -q 'windowSoftInputMode' "$M"; then
@@ -156,18 +169,17 @@ jobs:
               "$M"
           fi
 
-          npx cap sync android
-
       - name: Build debug APK
         working-directory: ${{ env.PROJ }}
         shell: bash
         run: |
           set -euo pipefail
+
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug
 
-      - name: Verify APK exists
+      - name: Verify APK
         working-directory: ${{ env.PROJ }}
         shell: bash
         run: |
@@ -176,7 +188,7 @@ jobs:
           APK="android/app/build/outputs/apk/debug/app-debug.apk"
 
           if [ ! -s "$APK" ]; then
-            echo "::error::APK was not generated or is empty."
+            echo "::error::APK was not generated."
             exit 1
           fi
 
@@ -190,7 +202,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Publish APK under Releases
+      - name: Publish APK release
         working-directory: ${{ env.PROJ }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -204,4 +216,4 @@ jobs:
           gh release create "$TAG" "$APK" \
             --repo "$GITHUB_REPOSITORY" \
             --title "C# Studio APK #${{ github.run_number }}" \
-            --notes "Debug APK built from the uploaded ZIP."
+            --notes "Debug APK built from the uploaded project ZIP."
